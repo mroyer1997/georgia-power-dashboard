@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Environment — contains credentials, never commit
+.env
+
+# Disk cache — contains your personal energy data, never commit
+gpower_cache.json
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*

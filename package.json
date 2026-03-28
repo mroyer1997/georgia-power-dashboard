@@ -1,0 +1,16 @@
+{
+  "name": "gpower-dashboard",
+  "version": "1.0.0",
+  "description": "Georgia Power Overnight Advantage energy cost analyzer",
+  "type": "module",
+  "scripts": {
+    "cli": "node --require dotenv/config gpower_cli.js",
+    "server": "node --require dotenv/config gpower_server.js",
+    "start": "node --require dotenv/config gpower_server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "southern-company-api": "latest",
+    "dotenv": "^16.4.5"
+  }
+}
