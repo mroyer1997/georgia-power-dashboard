@@ -205,6 +205,22 @@ function getDashboardHTML() {
   .kpi.off   .value { color: var(--off); }
   .kpi.on    .value { color: var(--on);  }
   .kpi.total .value { color: var(--total); }
+  .kpi.avg   .value { color: var(--muted); font-size: 18px; }
+  .kpi-avg-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+  .kpi-avg-grid .kpi { border-style: dashed; }
+  .kpi-avg-label {
+    font-size: 11px;
+    font-family: 'IBM Plex Mono', monospace;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    color: var(--muted);
+    margin-bottom: 10px;
+  }
 
   /* ── Window tabs ── */
   .window-tabs {
@@ -223,6 +239,20 @@ function getDashboardHTML() {
   }
   .tab:hover { border-color: var(--accent); color: var(--accent); }
   .tab.active { background: var(--accent); border-color: var(--accent); color: var(--bg); font-weight: 600; }
+
+  /* ── Tab mode toggle ── */
+  .tab-mode-toggle {
+    display: flex; gap: 0; margin-bottom: 12px; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; width: fit-content;
+  }
+  .mode-btn {
+    padding: 5px 14px; background: transparent; border: none;
+    color: var(--muted); cursor: pointer;
+    font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+    transition: all .15s; border-right: 1px solid var(--border);
+  }
+  .mode-btn:last-child { border-right: none; }
+  .mode-btn.active { background: var(--surface); color: var(--accent); font-weight: 600; }
+  .mode-btn:hover:not(.active) { color: var(--text); }
 
   /* ── Charts section ── */
   .charts-grid {
@@ -357,11 +387,21 @@ function getDashboardHTML() {
   <div id="loading"><div class="spinner"></div><div>Fetching data from Georgia Power…</div></div>
   <div id="dashboard" style="display:none">
 
+    <!-- Tab mode toggle -->
+    <div class="tab-mode-toggle">
+      <button class="mode-btn active" id="mode30" onclick="setMode('30day')">30-Day</button>
+      <button class="mode-btn" id="modeBilling" onclick="setMode('billing')">Billing Cycles</button>
+    </div>
+
     <!-- Window tabs -->
     <div class="window-tabs" id="windowTabs"></div>
 
     <!-- KPI cards -->
     <div class="kpi-grid" id="kpiGrid"></div>
+
+    <!-- Daily averages -->
+    <div class="kpi-avg-label" id="avgLabel"></div>
+    <div class="kpi-avg-grid" id="avgGrid"></div>
 
     <!-- Charts -->
     <div class="charts-grid">
@@ -399,6 +439,7 @@ function getDashboardHTML() {
 <script>
 let allData = null;
 let currentWindowIdx = 0;
+let tabMode = '30day';   // '30day' | 'billing'
 let kwhChartInst = null;
 let costChartInst = null;
 
@@ -421,6 +462,38 @@ function sumDays(days) {
     dsmr: s.dsmr + r.dsmrCharge, mff: s.mff + r.mffCharge,
     total: s.total + r.totalEstimated,
   }), { kWh:0,kWhSup:0,kWhOff:0,kWhOn:0,baseEnergy:0,basicSvc:0,fcr:0,eccr:0,dsmr:0,mff:0,total:0 });
+}
+
+function setMode(mode) {
+  tabMode = mode;
+  currentWindowIdx = 0;
+  document.getElementById('mode30').classList.toggle('active', mode === '30day');
+  document.getElementById('modeBilling').classList.toggle('active', mode === 'billing');
+  // Hide billing toggle if no cycles available
+  const cycles = allData?.accounts?.[0]?.billingCycles ?? [];
+  document.getElementById('modeBilling').disabled = cycles.length === 0;
+  render();
+}
+
+// Returns chunks based on current tab mode
+function getChunks(days, billingCycles) {
+  if (tabMode === 'billing' && billingCycles && billingCycles.length > 0) {
+    return billingCycles.map(cycle => ({
+      label    : cycle.label,
+      startDate: cycle.startDate,
+      endDate  : cycle.endDate,
+      days     : days.filter(d => d.date >= cycle.startDate && d.date <= cycle.endDate),
+    })).filter(c => c.days.length > 0);
+  }
+  // Default: 30-day chunks
+  const chunks = [];
+  for (let i = 0; i < days.length; i += 30) chunks.push(days.slice(i, i + 30));
+  return chunks.map(c => ({
+    label    : c[0].date.slice(0, 7),
+    startDate: c[0].date,
+    endDate  : c[c.length-1].date,
+    days     : c,
+  }));
 }
 
 async function loadData() {
@@ -446,10 +519,15 @@ async function refreshData() {
 }
 
 function render() {
-  const acct  = allData.accounts[0];
-  const days  = acct.days;
-  const chunks = chunkBy30(days);
+  const acct   = allData.accounts[0];
+  const days   = acct.days;
+  const cycles = acct.billingCycles ?? [];
+  const chunks = getChunks(days, cycles);
   const rates  = allData.rates;
+
+  // Show/hide billing mode button
+  document.getElementById('modeBilling').style.opacity = cycles.length > 0 ? '1' : '0.35';
+  document.getElementById('modeBilling').title = cycles.length === 0 ? 'No billing cycle data available' : '';
 
   // Header meta
   document.getElementById('header-meta').textContent =
@@ -463,45 +541,73 @@ function render() {
   chunks.forEach((chunk, i) => {
     const btn = document.createElement('button');
     btn.className = 'tab' + (i === currentWindowIdx ? ' active' : '');
-    btn.textContent = chunk[0].date.slice(0, 7) + (chunk.length < 30 ? ' (partial)' : '');
-    btn.onclick = () => { currentWindowIdx = i; renderWindow(chunks, rates); updateTabs(chunks); };
+    const isPartial = tabMode === '30day' && chunk.days.length < 30;
+    btn.textContent = chunk.label + (isPartial ? ' (partial)' : '');
+    btn.onclick = () => { currentWindowIdx = i; renderWindow(chunks, rates, cycles); updateTabs(chunks); };
     tabsEl.appendChild(btn);
   });
   if (chunks.length > 1) {
     const allBtn = document.createElement('button');
     allBtn.className = 'tab' + (currentWindowIdx === -1 ? ' active' : '');
     allBtn.textContent = 'All';
-    allBtn.onclick = () => { currentWindowIdx = -1; renderWindow(chunks, rates); updateTabs(chunks); };
+    allBtn.onclick = () => { currentWindowIdx = -1; renderWindow(chunks, rates, cycles); updateTabs(chunks); };
     tabsEl.appendChild(allBtn);
   }
 
-  renderWindow(chunks, rates);
+  renderWindow(chunks, rates, cycles);
   renderRates(rates);
   document.getElementById('loading').style.display = 'none';
   document.getElementById('dashboard').style.display = 'block';
 }
 
 function updateTabs(chunks) {
-  document.querySelectorAll('.tab').forEach((btn, i) => {
+  document.querySelectorAll('#windowTabs .tab').forEach((btn, i) => {
     const idx = i === chunks.length ? -1 : i;
     btn.classList.toggle('active', idx === currentWindowIdx);
   });
 }
 
-function renderWindow(chunks, rates) {
-  const windowDays = currentWindowIdx === -1
-    ? chunks.flat()
-    : (chunks[currentWindowIdx] ?? []);
+function renderWindow(chunks, rates, cycles) {
+  const windowChunk = currentWindowIdx === -1
+    ? { days: chunks.flatMap(c => c.days), label: 'All' }
+    : (chunks[currentWindowIdx] ?? { days: [], label: '' });
+  const windowDays = windowChunk.days;
   const tot = sumDays(windowDays);
+  const n   = Math.max(1, windowDays.length);
 
-  // KPIs
+  // KPIs — totals for window
   document.getElementById('kpiGrid').innerHTML = [
     { cls:'sup',   label:'Super Off-Peak kWh', value: tot.kWhSup.toFixed(1),  sub: pct(tot.kWhSup, tot.kWh) + ' of total' },
     { cls:'off',   label:'Off-Peak kWh',        value: tot.kWhOff.toFixed(1),  sub: pct(tot.kWhOff, tot.kWh) + ' of total' },
     { cls:'on',    label:'On-Peak kWh',          value: tot.kWhOn.toFixed(1),   sub: pct(tot.kWhOn, tot.kWh) + ' of total' },
     { cls:'total', label:'Total kWh',            value: tot.kWh.toFixed(1),     sub: windowDays.length + ' days' },
-    { cls:'total', label:'Est. Energy Cost',     value: usd(tot.total),          sub: 'avg ' + usd(tot.total / Math.max(1, windowDays.length)) + '/day' },
+    { cls:'total', label:'Est. Energy Cost',     value: usd(tot.total),          sub: 'avg ' + usd(tot.total / n) + '/day' },
     { cls:'total', label:'Blended Rate',         value: tot.kWh > 0 ? (tot.total / tot.kWh * 100).toFixed(2) + '¢' : '—', sub: 'per kWh all-in' },
+  ].map(k => \`
+    <div class="kpi \${k.cls}">
+      <div class="label">\${k.label}</div>
+      <div class="value">\${k.value}</div>
+      <div class="sub">\${k.sub}</div>
+    </div>
+  \`).join('');
+
+  // Daily averages row
+  const avgSupKwh  = tot.kWhSup  / n;
+  const avgOffKwh  = tot.kWhOff  / n;
+  const avgOnKwh   = tot.kWhOn   / n;
+  const avgTotKwh  = tot.kWh     / n;
+  const avgSupCost = (tot.baseEnergy > 0 ? windowDays.reduce((s,d) => s + d.baseEnergy * (d.kWhSuperOffPeak / Math.max(0.001, d.kWhTotal)), 0) : 0) / n;
+  const avgOffCost = (tot.baseEnergy > 0 ? windowDays.reduce((s,d) => s + d.baseEnergy * (d.kWhOffPeak / Math.max(0.001, d.kWhTotal)), 0) : 0) / n;
+  const avgOnCost  = (tot.baseEnergy > 0 ? windowDays.reduce((s,d) => s + d.baseEnergy * (d.kWhOnPeak / Math.max(0.001, d.kWhTotal)), 0) : 0) / n;
+  const avgTotal   = tot.total / n;
+
+  document.getElementById('avgLabel').textContent = \`Daily Averages — \${windowChunk.label}\`;
+  document.getElementById('avgGrid').innerHTML = [
+    { cls:'sup', label:'Avg Super Off-Pk/day', value: avgSupKwh.toFixed(2) + ' kWh', sub: usd(avgSupCost) + '/day est.' },
+    { cls:'off', label:'Avg Off-Peak/day',      value: avgOffKwh.toFixed(2) + ' kWh', sub: usd(avgOffCost) + '/day est.' },
+    { cls:'on',  label:'Avg On-Peak/day',       value: avgOnKwh.toFixed(2)  + ' kWh', sub: usd(avgOnCost)  + '/day est.' },
+    { cls:'total',label:'Avg Total kWh/day',    value: avgTotKwh.toFixed(2) + ' kWh', sub: '' },
+    { cls:'total',label:'Avg Daily Cost',        value: usd(avgTotal),                  sub: (avgTotKwh > 0 ? (avgTotal/avgTotKwh*100).toFixed(2) + '¢/kWh' : '') },
   ].map(k => \`
     <div class="kpi \${k.cls}">
       <div class="label">\${k.label}</div>

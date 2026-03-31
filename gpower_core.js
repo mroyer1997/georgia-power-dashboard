@@ -268,6 +268,59 @@ export async function fetchAndProcess({ username, password, account, cityLimits 
 
 // ─── Aggregate helper ─────────────────────────────────────────────────────────
 
+// ─── Billing cycles ──────────────────────────────────────────────────────────
+// Fetches billing period boundaries from getMonthlyData() and caches them
+// in gpower_cache.json under a '_billingCycles' key.
+
+export async function fetchBillingCycles(api, accountNumber, diskCache) {
+  const cacheKey = '_billingCycles_' + accountNumber;
+
+  // Re-use cached cycles if fetched today
+  const cached = diskCache[cacheKey];
+  const today  = new Date().toISOString().slice(0, 10);
+  if (cached && cached._fetchedDate === today) {
+    console.log(`  [billing cycles] Using cached cycles (${cached.cycles.length} periods)`);
+    return cached.cycles;
+  }
+
+  try {
+    console.log('  [billing cycles] Fetching from getMonthlyData()…');
+    const monthlyData = await api.getMonthlyData();
+
+    // getMonthlyData returns an array of arrays (one per account)
+    // Each element has { startDate, endDate, kWh, cost }
+    const accountData = monthlyData[0] ?? [];
+
+    const cycles = accountData
+      .filter(m => m.startDate && m.endDate)
+      .map(m => ({
+        // startDate/endDate are Date objects from the library
+        startDate : m.startDate instanceof Date
+          ? m.startDate.toISOString().slice(0, 10)
+          : String(m.startDate).slice(0, 10),
+        endDate   : m.endDate instanceof Date
+          ? m.endDate.toISOString().slice(0, 10)
+          : String(m.endDate).slice(0, 10),
+      }))
+      // Sort chronologically
+      .sort((a, b) => a.startDate.localeCompare(b.startDate))
+      // Label each cycle e.g. "Jan 2026"
+      .map(c => ({
+        ...c,
+        label: new Date(c.startDate + 'T12:00:00')
+          .toLocaleDateString('en-US', { month: 'short', year: 'numeric' }),
+      }));
+
+    // Persist
+    diskCache[cacheKey] = { _fetchedDate: today, cycles };
+    console.log(`  [billing cycles] ${cycles.length} billing periods found`);
+    return cycles;
+  } catch (e) {
+    console.warn(`  [billing cycles] Could not fetch: ${e.message}`);
+    return [];
+  }
+}
+
 export function sumDays(days) {
   return days.reduce((s, r) => ({
     kWh       : s.kWh        + r.kWhTotal,
@@ -394,7 +447,12 @@ export async function fetchAndProcessWithCache({ username, password, account, ci
       .sort((a, b) => a.date.localeCompare(b.date));
 
     console.log(`  → ${dailyResults.length} days total in results`);
-    results.push({ name: acct.name, accountNumber: acct.number, days: dailyResults });
+
+    // Fetch billing cycles (uses monthly data — different endpoint, fast)
+    const billingCycles = await fetchBillingCycles(api, acct.number, diskCache);
+    saveDiskCache(diskCache);  // persist billing cycles too
+
+    results.push({ name: acct.name, accountNumber: acct.number, days: dailyResults, billingCycles });
   }
 
   return results;
