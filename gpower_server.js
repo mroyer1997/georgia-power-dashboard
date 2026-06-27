@@ -16,33 +16,50 @@
  *   PORT          (default: 3000)
  */
 
-import express  from 'express';
+import express        from 'express';
+import multer         from 'multer';
+import { writeFileSync, existsSync, mkdirSync } from 'fs';
+import { join, basename } from 'path';
+import { loadEcobeeData, parseEcobeeCSV, aggregateHvacKwh, compressorKw, getSystemConfig } from './ecobee_core.js';
 import { fetchAndProcessWithCache, sumDays, BASE_RATES, RIDERS } from './gpower_core.js';
+import { fetchEmporiaEV } from './emporia_core.js';
 
 const USERNAME    = process.env.GP_USERNAME  ?? (() => { throw new Error('GP_USERNAME is not set. Copy .env.example to .env and fill in your credentials.'); })();
 const PASSWORD    = process.env.GP_PASSWORD  ?? (() => { throw new Error('GP_PASSWORD is not set. Copy .env.example to .env and fill in your credentials.'); })();
 const ACCOUNT     = process.env.GP_ACCOUNT;
 const CITY_LIMITS = (process.env.CITY_LIMITS ?? 'inside').toLowerCase();
-const PORT        = parseInt(process.env.PORT ?? '3000');
-const START_DATE  = new Date(2026, 1, 28);
+const PORT            = parseInt(process.env.PORT ?? '3000');
+const START_DATE      = new Date(2026, 1, 28);
+const EMPORIA_ENABLED = !!(process.env.EMPORIA_USERNAME && process.env.EMPORIA_PASSWORD);
 
 // ─── In-memory cache (avoids hammering GP's API on every browser refresh) ────
 let cache = null;
+let evCache = null;   // { 'YYYY-MM-DD': kWh } from Emporia
 let cacheTime = null;
 const CACHE_TTL_MS = 30 * 60 * 1000;   // 30 minutes
 
 async function getData() {
   const now = Date.now();
-  if (cache && cacheTime && (now - cacheTime) < CACHE_TTL_MS) return cache;
+  if (cache && cacheTime && (now - cacheTime) < CACHE_TTL_MS) {
+    return { accounts: cache, evByDay: evCache ?? {} };
+  }
   console.log('[cache miss] Fetching from Georgia Power…');
-  cache = await fetchAndProcessWithCache({
-    username: USERNAME, password: PASSWORD,
-    account: ACCOUNT, cityLimits: CITY_LIMITS,
-    startDate: START_DATE, endDate: new Date(),
-  });
+  const dateRange = { startDate: START_DATE, endDate: new Date() };
+  const [accounts, evByDay] = await Promise.all([
+    fetchAndProcessWithCache({
+      username: USERNAME, password: PASSWORD,
+      account: ACCOUNT, cityLimits: CITY_LIMITS,
+      ...dateRange,
+    }),
+    EMPORIA_ENABLED
+      ? fetchEmporiaEV(dateRange).catch(e => { console.warn('[emporia]', e.message); return {}; })
+      : Promise.resolve({}),
+  ]);
+  cache    = accounts;
+  evCache  = evByDay;
   cacheTime = now;
-  console.log('[cache] Data refreshed.');
-  return cache;
+  console.log('[cache] Data refreshed.' + (EMPORIA_ENABLED ? ` Emporia: ${Object.keys(evByDay).length} days.` : ''));
+  return { accounts, evByDay };
 }
 
 // ─── Express app ──────────────────────────────────────────────────────────────
@@ -52,10 +69,9 @@ const app = express();
 // JSON API endpoint — used by the dashboard via fetch()
 app.get('/api/data', async (req, res) => {
   try {
-    const accounts = await getData();
-    // Optionally force refresh with ?refresh=1
-    if (req.query.refresh === '1') { cache = null; }
-    res.json({ ok: true, accounts, rates: { BASE_RATES, RIDERS }, cityLimits: CITY_LIMITS });
+    if (req.query.refresh === '1') { cache = null; evCache = null; }
+    const { accounts, evByDay } = await getData();
+    res.json({ ok: true, accounts, evByDay, emporiaEnabled: EMPORIA_ENABLED, rates: { BASE_RATES, RIDERS }, cityLimits: CITY_LIMITS });
   } catch (err) {
     console.error(err);
     res.status(500).json({ ok: false, error: err.message });
@@ -64,11 +80,85 @@ app.get('/api/data', async (req, res) => {
 
 // Force-refresh endpoint
 app.post('/api/refresh', async (req, res) => {
-  cache = null;
+  cache = null; evCache = null;
   try {
     await getData();
     res.json({ ok: true });
   } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ── Multer: save uploaded Ecobee CSVs directly to the project folder ─────────
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, '.'),
+    filename   : (req, file, cb) => cb(null, file.originalname),
+  }),
+  fileFilter: (req, file, cb) => {
+    // Only accept CSV files with ecobee-style names
+    const ok = file.originalname.match(/report-\d+.*\.csv$/i);
+    cb(null, !!ok);
+  },
+  limits: { fileSize: 20 * 1024 * 1024 },  // 20 MB max per file
+});
+
+// ── Ecobee data endpoint ──────────────────────────────────────────────────────
+let ecobeeCache = null;
+
+function rebuildEcobeeCache() {
+  ecobeeCache = loadEcobeeData('.');
+}
+
+app.get('/api/ecobee', (req, res) => {
+  try {
+    if (!ecobeeCache || req.query.refresh === '1') rebuildEcobeeCache();
+    res.json({ ok: true, ...ecobeeCache });
+  } catch (err) {
+    console.error('[ecobee]', err.message);
+    res.json({ ok: false, error: err.message, byDay: {}, thermostats: [] });
+  }
+});
+
+// ── Ecobee CSV import endpoint ────────────────────────────────────────────────
+// Accepts one or more CSV files via multipart upload, saves to project folder,
+// re-processes all ecobee data, returns updated summary.
+app.post('/api/ecobee/import', upload.array('files', 10), (req, res) => {
+  try {
+    const saved = (req.files ?? []).map(f => f.originalname);
+    if (saved.length === 0) {
+      return res.status(400).json({ ok: false, error: 'No valid Ecobee CSV files received. File names must match: report-XXXXXXXXXX-YYYY-MM-DD-to-YYYY-MM-DD.csv' });
+    }
+
+    // Validate each file is actually an ecobee CSV before accepting
+    const validated = [];
+    for (const file of req.files) {
+      try {
+        const { meta, intervals } = parseEcobeeCSV(file.path);
+        if (!meta.identifier || intervals.length === 0) {
+          return res.status(400).json({ ok: false, error: file.originalname + ' does not appear to be a valid Ecobee runtime report.' });
+        }
+        validated.push({ filename: file.originalname, thermostatName: meta.name ?? 'Unknown', identifier: meta.identifier, intervals: intervals.length });
+      } catch (e) {
+        return res.status(400).json({ ok: false, error: 'Could not parse ' + file.originalname + ': ' + e.message });
+      }
+    }
+
+    // Re-build the full ecobee dataset from all CSVs now in the folder
+    rebuildEcobeeCache();
+    console.log('[ecobee] Imported:', saved.join(', '));
+
+    res.json({
+      ok       : true,
+      imported : validated,
+      summary  : {
+        totalDays      : Object.keys(ecobeeCache.byDay).length,
+        thermostats    : ecobeeCache.thermostats.map(t => t.name + ' (' + t.dayCount + ' days)'),
+      },
+      ...ecobeeCache,
+    });
+  } catch (err) {
+    console.error('[ecobee import]', err.message);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -108,6 +198,7 @@ function getDashboardHTML() {
     --off:      #3fb950;   /* off-peak — green */
     --on:       #f85149;   /* on-peak — red */
     --total:    #d29922;   /* cost — amber */
+    --ev:       #bc8cff;   /* EV charger — purple */
     --accent:   #58a6ff;
   }
 
@@ -205,6 +296,7 @@ function getDashboardHTML() {
   .kpi.off   .value { color: var(--off); }
   .kpi.on    .value { color: var(--on);  }
   .kpi.total .value { color: var(--total); }
+  .kpi.ev    .value { color: var(--ev); }
   .kpi.avg   .value { color: var(--muted); font-size: 18px; }
   .kpi-avg-grid {
     display: grid;
@@ -380,7 +472,12 @@ function getDashboardHTML() {
     <h1>⚡ Georgia Power — Overnight Advantage Dashboard</h1>
     <div class="meta" id="header-meta">Loading…</div>
   </div>
-  <button class="refresh-btn" id="refreshBtn" onclick="refreshData()">↻ Refresh</button>
+  <div style="display:flex;gap:8px;align-items:center">
+    <button class="refresh-btn" id="evBtn"   onclick="toggleEv()"   style="border-color:var(--ev);color:var(--ev);display:none">⚡ EV</button>
+    <button class="refresh-btn" id="hvacBtn" onclick="toggleHvac()" style="border-color:var(--sup);color:var(--sup)">⚡ HVAC</button>
+    <button class="refresh-btn" id="hvacRefreshBtn" onclick="refreshHvac()" style="display:none;border-color:var(--sup);color:var(--sup)" title="Reload Ecobee CSV data">↻ HVAC</button>
+    <button class="refresh-btn" id="refreshBtn" onclick="refreshData()">↻ Refresh</button>
+  </div>
 </header>
 
 <main>
@@ -433,6 +530,112 @@ function getDashboardHTML() {
       <div class="rate-table" id="rateTable"></div>
     </div>
 
+    <!-- EV Analysis -->
+    <div id="evSection" style="margin-top:24px;display:none">
+      <div class="breakdown-card">
+        <h2 id="evTitle">EV Charging Analysis</h2>
+
+        <!-- EV KPI row -->
+        <div class="kpi-grid" id="evKpiGrid" style="margin-bottom:16px"></div>
+
+        <!-- Load split chart -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+          <div class="chart-card">
+            <h2>Daily Load Split — EV vs Baseline</h2>
+            <canvas id="evSplitChart"></canvas>
+          </div>
+
+          <!-- Savings panel -->
+          <div class="chart-card">
+            <h2>TOU-OA-14 vs Flat Rate — EV Savings</h2>
+            <div id="evSavingsGrid" style="display:flex;flex-direction:column;gap:8px;margin-bottom:10px"></div>
+            <div style="font-size:11px;color:var(--muted);margin-top:auto;padding-top:8px">
+              Flat rate baseline: RS-1 standard residential (~13¢/kWh all-in).<br>
+              TOU-OA-14 super off-peak all-in: ~7.8¢/kWh. Savings = cost difference on EV kWh.
+            </div>
+          </div>
+        </div>
+
+        <!-- EV day table -->
+        <div class="table-card">
+          <h2>Daily EV Charging Detail</h2>
+          <table id="evTable"></table>
+        </div>
+      </div>
+    </div>
+
+    <!-- HVAC Analysis -->
+    <div id="hvacSection" style="margin-top:24px;display:none">
+      <div class="breakdown-card">
+        <h2 id="hvacTitle">HVAC Energy Analysis</h2>
+        <div id="hvacStatus" style="font-size:12px;color:var(--muted);font-family:'IBM Plex Mono',monospace;margin-bottom:12px"></div>
+
+        <!-- HVAC KPI row -->
+        <div class="kpi-grid" id="hvacKpiGrid" style="margin-bottom:16px"></div>
+
+        <!-- HVAC + baseline stacked chart -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+          <div class="chart-card">
+            <h2>Daily kWh — HVAC vs Baseline</h2>
+            <canvas id="hvacStackChart"></canvas>
+          </div>
+          <div class="chart-card">
+            <h2>HVAC Cost by Rate Tier</h2>
+            <canvas id="hvacTierChart"></canvas>
+          </div>
+        </div>
+
+        <!-- Optimization panel -->
+        <div id="hvacOptPanel" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:16px">
+          <div style="font-size:12px;font-family:'IBM Plex Mono',monospace;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:12px">
+            On-Peak Cost Breakdown (June–Sept only)
+          </div>
+          <div id="hvacOptGrid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px"></div>
+          <div style="font-size:11px;color:var(--muted);margin-top:10px">
+            💡 Pre-cooling before 2pm and running AC after 7pm moves load to Off-Peak (10.2¢) vs On-Peak (29.8¢) — a 3× cost difference.
+          </div>
+        </div>
+
+        <!-- HVAC day table -->
+        <div class="table-card" style="margin-top:16px">
+          <h2>Daily HVAC Detail</h2>
+          <table id="hvacTable"></table>
+        </div>
+
+        <!-- Thermostat specs -->
+        <div id="hvacSpecs" style="margin-top:12px;font-size:11px;color:var(--muted);font-family:'IBM Plex Mono',monospace"></div>
+      </div>
+
+      <!-- CSV Import card -->
+      <div class="breakdown-card" style="margin-top:16px">
+        <h2>Import Ecobee Runtime CSVs</h2>
+        <div style="font-size:12px;color:var(--muted);margin-bottom:14px">
+          Download runtime reports from <strong style="color:var(--text)">ecobee.com → My Reports</strong> and import them here.
+          Each thermostat needs its own CSV. Multiple months can be imported at once — data is merged automatically.
+        </div>
+
+        <div id="importDropzone"
+          style="border:2px dashed var(--border);border-radius:8px;padding:32px;text-align:center;cursor:pointer;transition:all .2s;margin-bottom:14px"
+          onclick="document.getElementById('csvFileInput').click()"
+          ondragover="event.preventDefault();this.style.borderColor='var(--accent)'"
+          ondragleave="this.style.borderColor='var(--border)'"
+          ondrop="handleDrop(event)">
+          <div style="font-size:24px;margin-bottom:8px">📂</div>
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:13px;color:var(--muted)">
+            Click to select CSVs or drag &amp; drop here
+          </div>
+          <div style="font-size:11px;color:var(--muted);margin-top:6px">
+            Accepts: report-XXXXXXXXXXXX-YYYY-MM-DD-to-YYYY-MM-DD.csv
+          </div>
+          <input type="file" id="csvFileInput" accept=".csv" multiple
+            style="display:none" onchange="handleFileSelect(this.files)">
+        </div>
+
+        <div id="importStatus" style="display:none;padding:12px;border-radius:6px;font-family:'IBM Plex Mono',monospace;font-size:12px;margin-bottom:10px"></div>
+        <div id="importResults" style="display:none"></div>
+      </div>
+    </div>
+
   </div>
 </main>
 
@@ -442,6 +645,127 @@ let currentWindowIdx = 0;
 let tabMode = '30day';   // '30day' | 'billing'
 let kwhChartInst = null;
 let costChartInst = null;
+
+// EV — all kWh attributed to Super Off-Peak (charger enforces 11pm–7am window)
+// All-in rate: base(2.1859¢) + FCR(4.2398¢), then ×(1+ECCR+DSM-R)×(1+MFF-inside)
+// = 0.064257 × 1.174978 × 1.030701 ≈ 7.78¢/kWh
+const EV_RATE_ALLIN = 0.07782;   // $/kWh all-in super off-peak
+const FLAT_RATE     = 0.13;      // $/kWh — RS-1 standard residential comparison
+
+let evVisible   = false;
+let evSplitInst = null;
+
+function toggleEv() {
+  evVisible = !evVisible;
+  document.getElementById('evSection').style.display = evVisible ? 'block' : 'none';
+  document.getElementById('evBtn').style.opacity = evVisible ? '1' : '0.6';
+  if (evVisible) renderEv();
+}
+
+function renderEv() {
+  if (!allData) return;
+  const evByDay  = allData.evByDay ?? {};
+  const gpDays   = allData.accounts[0].days;
+  const chunks   = getChunks(gpDays, allData.accounts[0].billingCycles ?? []);
+  const windowDays = currentWindowIdx === -1
+    ? chunks.flatMap(c => c.days)
+    : (chunks[currentWindowIdx]?.days ?? []);
+
+  const combined = windowDays.map(gp => {
+    const evKwh    = evByDay[gp.date] ?? 0;
+    const baseline = Math.max(0, gp.kWhTotal - evKwh);
+    return { ...gp, evKwh, baseline };
+  });
+
+  const totEv       = combined.reduce((s, d) => s + d.evKwh, 0);
+  const totGP       = combined.reduce((s, d) => s + d.kWhTotal, 0);
+  const n           = Math.max(1, combined.length);
+  const chargeDays  = combined.filter(d => d.evKwh > 0.5).length;
+  const evCost      = totEv * EV_RATE_ALLIN;
+  const flatCost    = totEv * FLAT_RATE;
+  const savings     = flatCost - evCost;
+
+  const label = currentWindowIdx === -1 ? 'All' : (chunks[currentWindowIdx]?.label ?? '');
+  document.getElementById('evTitle').textContent = \`EV Charging Analysis — \${label}\`;
+
+  // KPI cards
+  document.getElementById('evKpiGrid').innerHTML = [
+    { cls:'ev',    label:'EV kWh (window)',       value: totEv.toFixed(1),                          sub: (totGP > 0 ? (totEv/totGP*100).toFixed(0) : '0') + '% of total GP usage' },
+    { cls:'ev',    label:'Est. EV Cost',           value: usd(evCost),                               sub: (EV_RATE_ALLIN*100).toFixed(2) + '¢/kWh all-in (super off-peak)' },
+    { cls:'off',   label:'Flat-Rate Cost (RS-1)',  value: usd(flatCost),                             sub: (FLAT_RATE*100).toFixed(0) + '¢/kWh standard residential' },
+    { cls:'sup',   label:'TOU Savings (window)',   value: usd(savings),                              sub: savings > 0 ? 'saved vs flat rate this window' : '' },
+    { cls:'total', label:'Charge Days',            value: chargeDays + ' / ' + n,                   sub: 'days with > 0.5 kWh EV load' },
+    { cls:'ev',    label:'Avg kWh / Charge Day',  value: chargeDays > 0 ? (totEv/chargeDays).toFixed(1) + ' kWh' : '—', sub: '' },
+  ].map(k => \`
+    <div class="kpi \${k.cls}">
+      <div class="label">\${k.label}</div>
+      <div class="value">\${k.value}</div>
+      <div class="sub">\${k.sub}</div>
+    </div>
+  \`).join('');
+
+  // Savings breakdown rows
+  document.getElementById('evSavingsGrid').innerHTML = [
+    { name: 'EV kWh this window',       amt: totEv.toFixed(1) + ' kWh',                          color: 'var(--ev)' },
+    { name: 'TOU-OA-14 EV cost',        amt: usd(evCost) + '  (' + (EV_RATE_ALLIN*100).toFixed(2) + '¢/kWh)', color: 'var(--ev)' },
+    { name: 'RS-1 flat-rate cost',      amt: usd(flatCost) + '  (' + (FLAT_RATE*100).toFixed(0) + '¢/kWh)',   color: 'var(--off)' },
+    { name: 'Savings from TOU plan',    amt: usd(savings),                                         color: 'var(--sup)' },
+  ].map(r => \`
+    <div class="breakdown-row">
+      <span class="name">\${r.name}</span>
+      <span class="amt" style="color:\${r.color}">\${r.amt}</span>
+    </div>
+  \`).join('');
+
+  // Load split chart
+  if (evSplitInst) evSplitInst.destroy();
+  const ctx = document.getElementById('evSplitChart').getContext('2d');
+  evSplitInst = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: combined.map(d => d.date.slice(5)),
+      datasets: [
+        { label: 'EV',       data: combined.map(d => +d.evKwh.toFixed(2)),   backgroundColor: 'rgba(188,140,255,.8)', stack: 's' },
+        { label: 'Baseline', data: combined.map(d => +d.baseline.toFixed(2)), backgroundColor: 'rgba(63,185,80,.55)',   stack: 's' },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: true,
+      plugins: { legend: { labels: { color: '#7d8590', boxWidth: 12, font: { size: 11 } } } },
+      scales: {
+        x: { stacked: true, ticks: { color: '#7d8590', maxTicksLimit: 10, font: { family: 'IBM Plex Mono', size: 10 } }, grid: { color: '#21262d' } },
+        y: { stacked: true, ticks: { color: '#7d8590', font: { family: 'IBM Plex Mono', size: 10 } }, grid: { color: '#21262d' } },
+      },
+    },
+  });
+
+  // Day table
+  document.getElementById('evTable').innerHTML = \`
+    <thead><tr>
+      <th style="text-align:left">Date</th>
+      <th>GP kWh</th>
+      <th style="color:var(--ev)">EV kWh</th>
+      <th>Baseline kWh</th>
+      <th style="color:var(--ev)">EV Cost</th>
+      <th style="color:var(--off)">Flat Cost</th>
+      <th style="color:var(--sup)">Saved</th>
+    </tr></thead>
+    <tbody>\${combined.map(d => {
+      const cost  = d.evKwh * EV_RATE_ALLIN;
+      const flat  = d.evKwh * FLAT_RATE;
+      const saved = flat - cost;
+      const charged = d.evKwh > 0.5;
+      return \`<tr>
+        <td>\${d.date}</td>
+        <td>\${d.kWhTotal.toFixed(2)}</td>
+        <td style="color:var(--ev)">\${d.evKwh.toFixed(2)}</td>
+        <td>\${d.baseline.toFixed(2)}</td>
+        <td style="color:var(--ev)">\${charged ? usd(cost) : '—'}</td>
+        <td style="color:var(--off)">\${charged ? usd(flat) : '—'}</td>
+        <td style="color:var(--sup)">\${charged ? usd(saved) : '—'}</td>
+      </tr>\`;
+    }).join('')}</tbody>\`;
+}
 
 const usd  = n  => '$' + n.toFixed(2);
 const u4   = n  => '$' + n.toFixed(4);
@@ -466,7 +790,7 @@ function sumDays(days) {
 
 function setMode(mode) {
   tabMode = mode;
-  currentWindowIdx = 0;
+  currentWindowIdx = 0;  // 0 = latest chunk after reversal
   document.getElementById('mode30').classList.toggle('active', mode === '30day');
   document.getElementById('modeBilling').classList.toggle('active', mode === 'billing');
   // Hide billing toggle if no cycles available
@@ -475,7 +799,7 @@ function setMode(mode) {
   render();
 }
 
-// Returns chunks based on current tab mode
+// Returns chunks based on current tab mode, newest first
 function getChunks(days, billingCycles) {
   if (tabMode === 'billing' && billingCycles && billingCycles.length > 0) {
     return billingCycles.map(cycle => ({
@@ -483,9 +807,9 @@ function getChunks(days, billingCycles) {
       startDate: cycle.startDate,
       endDate  : cycle.endDate,
       days     : days.filter(d => d.date >= cycle.startDate && d.date <= cycle.endDate),
-    })).filter(c => c.days.length > 0);
+    })).filter(c => c.days.length > 0).reverse();  // newest billing cycle first
   }
-  // Default: 30-day chunks
+  // Default: 30-day chunks, reversed so most recent is index 0
   const chunks = [];
   for (let i = 0; i < days.length; i += 30) chunks.push(days.slice(i, i + 30));
   return chunks.map(c => ({
@@ -493,7 +817,7 @@ function getChunks(days, billingCycles) {
     startDate: c[0].date,
     endDate  : c[c.length-1].date,
     days     : c,
-  }));
+  })).reverse();
 }
 
 async function loadData() {
@@ -553,6 +877,10 @@ function render() {
     allBtn.onclick = () => { currentWindowIdx = -1; renderWindow(chunks, rates, cycles); updateTabs(chunks); };
     tabsEl.appendChild(allBtn);
   }
+
+  // Show EV button only when Emporia data is available
+  const hasEv = allData.emporiaEnabled && Object.keys(allData.evByDay ?? {}).length > 0;
+  document.getElementById('evBtn').style.display = hasEv ? 'inline-block' : 'none';
 
   renderWindow(chunks, rates, cycles);
   renderRates(rates);
@@ -719,6 +1047,12 @@ function renderCostChart(labels, days) {
       }
     }
   });
+
+  // Keep EV and HVAC panels in sync with the current window
+  if (evVisible) renderEv();
+  if (typeof hvacVisible !== 'undefined' && hvacVisible && typeof hvacData !== 'undefined' && hvacData) {
+    renderHvac();
+  }
 }
 
 function renderRates(rates) {
@@ -741,6 +1075,269 @@ function renderRates(rates) {
       <div class="rt-desc">\${r.desc}</div>
     </div>
   \`).join('');
+}
+
+// ── HVAC Analysis ────────────────────────────────────────────────────────────
+let hvacData = null;
+let hvacVisible = false;
+let hvacStackInst = null;
+let hvacTierInst = null;
+
+async function toggleHvac() {
+  hvacVisible = !hvacVisible;
+  document.getElementById('hvacSection').style.display = hvacVisible ? 'block' : 'none';
+  document.getElementById('hvacBtn').style.opacity    = hvacVisible ? '1' : '0.6';
+  document.getElementById('hvacRefreshBtn').style.display = hvacVisible ? 'inline-block' : 'none';
+  if (hvacVisible) await loadHvacData();  // always reload when opening
+}
+
+async function refreshHvac() {
+  const btn = document.getElementById('hvacRefreshBtn');
+  btn.disabled = true;
+  btn.textContent = '↻ Loading…';
+  await loadHvacData();
+  btn.disabled = false;
+  btn.textContent = '↻ HVAC';
+}
+
+async function loadHvacData() {
+  document.getElementById('hvacStatus').textContent = 'Loading Ecobee CSV data…';
+  try {
+    // Always force a fresh fetch from server (?refresh=1 busts the server-side cache)
+    const res  = await fetch('/api/ecobee?refresh=1');
+    hvacData   = await res.json();
+    if (!hvacData.ok && !hvacData.byDay) {
+      document.getElementById('hvacStatus').textContent = 'Error: ' + (hvacData.error ?? 'unknown');
+      return;
+    }
+    // Make HVAC panel visible if it isn't already (e.g. called from import handler)
+    if (!hvacVisible) {
+      hvacVisible = true;
+      document.getElementById('hvacSection').style.display = 'block';
+      document.getElementById('hvacBtn').style.opacity = '1';
+    }
+    renderHvac();
+  } catch(e) {
+    document.getElementById('hvacStatus').textContent = 'Error: ' + e.message;
+  }
+}
+
+function renderHvac() {
+  if (!hvacData || !allData) return;
+  const gpDays   = allData.accounts[0].days;    // GP hourly data
+  const ecoDays  = hvacData.byDay ?? {};         // ecobee data
+
+  // Match ecobee days to current window
+  const chunks     = getChunks(gpDays, allData.accounts[0].billingCycles ?? []);
+  const windowDays = currentWindowIdx === -1 ? chunks.flatMap(c => c.days) : (chunks[currentWindowIdx]?.days ?? []);
+
+  // Build combined day array — GP total + HVAC estimate + baseline
+  const combined = windowDays.map(gp => {
+    const eco      = ecoDays[gp.date] ?? { totalKwh:0, coolKwh:0, fanKwh:0, coolMin:0, heatMin:0, peakCoolKwh:0, offPeakCoolKwh:0, supOffPeakCoolKwh:0 };
+    const baseline = Math.max(0, gp.kWhTotal - eco.totalKwh);
+    return { ...gp, hvacKwh: eco.totalKwh, coolKwh: eco.coolKwh, fanKwh: eco.fanKwh,
+             coolMin: eco.coolMin, heatMin: eco.heatMin,
+             peakHvac: eco.peakCoolKwh, offPeakHvac: eco.offPeakCoolKwh, supHvac: eco.supOffPeakCoolKwh,
+             baseline };
+  });
+
+  // Totals
+  const totHvac     = combined.reduce((s,d) => s + d.hvacKwh, 0);
+  const totBaseline = combined.reduce((s,d) => s + d.baseline, 0);
+  const totGP       = combined.reduce((s,d) => s + d.kWhTotal, 0);
+  const totPeakHvac = combined.reduce((s,d) => s + d.peakHvac, 0);
+  const totOffHvac  = combined.reduce((s,d) => s + d.offPeakHvac, 0);
+  const totSupHvac  = combined.reduce((s,d) => s + d.supHvac, 0);
+  const n           = Math.max(1, combined.length);
+
+  // HVAC cost estimates (using GP rate tiers)
+  const PEAK_RATE = 0.297868 + 0.066871; // base + FCR on-peak
+  const OFF_RATE  = 0.101676 + 0.042398;
+  const SUP_RATE  = 0.021859 + 0.042398;
+  const totHvacCost = totPeakHvac * PEAK_RATE + totOffHvac * OFF_RATE + totSupHvac * SUP_RATE;
+
+  // Status line
+  const therms = (hvacData.thermostats ?? []).map(t => t.name + ' (' + t.tons + 't ' + t.seer + ' SEER)').join(', ');
+  document.getElementById('hvacStatus').textContent = 'Data: ' + therms;
+  document.getElementById('hvacTitle').textContent = 'HVAC Energy Analysis — ' + (currentWindowIdx === -1 ? 'All' : chunks[currentWindowIdx]?.label ?? '');
+
+  // KPI cards
+  const hvacPct = totGP > 0 ? (totHvac / totGP * 100).toFixed(0) : '—';
+  document.getElementById('hvacKpiGrid').innerHTML = [
+    { cls:'sup',   label:'HVAC kWh (window)',     value: totHvac.toFixed(1),         sub: hvacPct + '% of total GP usage' },
+    { cls:'off',   label:'Baseline kWh',           value: totBaseline.toFixed(1),     sub: (100 - parseInt(hvacPct || 0)) + '% of total (non-HVAC)' },
+    { cls:'on',    label:'On-Peak HVAC Cost',      value: usd(totPeakHvac * PEAK_RATE), sub: totPeakHvac.toFixed(1) + ' kWh @ 36.5¢ (Jun–Sep only)' },
+    { cls:'total', label:'Est. HVAC Cost',         value: usd(totHvacCost),           sub: 'avg ' + usd(totHvacCost / n) + '/day' },
+    { cls:'sup',   label:'Avg Cool Runtime/Day',   value: (combined.reduce((s,d) => s+d.coolMin,0)/n).toFixed(0) + ' min', sub: '' },
+    { cls:'total', label:'Avg HVAC kWh/Day',       value: (totHvac / n).toFixed(2),  sub: '' },
+  ].map(k => \`<div class="kpi \${k.cls}"><div class="label">\${k.label}</div><div class="value">\${k.value}</div><div class="sub">\${k.sub}</div></div>\`).join('');
+
+  // Stacked bar: HVAC vs Baseline
+  if (hvacStackInst) hvacStackInst.destroy();
+  const ctx1 = document.getElementById('hvacStackChart').getContext('2d');
+  const labels = combined.map(d => d.date.slice(5));
+  hvacStackInst = new Chart(ctx1, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        { label: 'HVAC',     data: combined.map(d => +d.hvacKwh.toFixed(2)),   backgroundColor: 'rgba(248,81,73,.8)',  stack: 's' },
+        { label: 'Baseline', data: combined.map(d => +d.baseline.toFixed(2)),  backgroundColor: 'rgba(63,185,80,.6)', stack: 's' },
+      ]
+    },
+    options: {
+      responsive:true, maintainAspectRatio:true,
+      plugins:{ legend:{ labels:{ color:'#7d8590', boxWidth:12, font:{size:11} } } },
+      scales:{
+        x:{ stacked:true, ticks:{color:'#7d8590',maxTicksLimit:10,font:{family:'IBM Plex Mono',size:10}}, grid:{color:'#21262d'} },
+        y:{ stacked:true, ticks:{color:'#7d8590',font:{family:'IBM Plex Mono',size:10}}, grid:{color:'#21262d'} }
+      }
+    }
+  });
+
+  // Tier cost bar chart
+  if (hvacTierInst) hvacTierInst.destroy();
+  const ctx2 = document.getElementById('hvacTierChart').getContext('2d');
+  hvacTierInst = new Chart(ctx2, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        { label:'On-Peak HVAC',      data: combined.map(d => +(d.peakHvac * PEAK_RATE).toFixed(3)),  backgroundColor:'rgba(248,81,73,.8)',  stack:'t' },
+        { label:'Off-Peak HVAC',     data: combined.map(d => +(d.offPeakHvac * OFF_RATE).toFixed(3)),backgroundColor:'rgba(63,185,80,.7)',  stack:'t' },
+        { label:'Super Off-Pk HVAC', data: combined.map(d => +(d.supHvac * SUP_RATE).toFixed(3)),    backgroundColor:'rgba(88,166,255,.7)', stack:'t' },
+      ]
+    },
+    options: {
+      responsive:true, maintainAspectRatio:true,
+      plugins:{ legend:{ labels:{ color:'#7d8590', boxWidth:12, font:{size:11} } } },
+      scales:{
+        x:{ stacked:true, ticks:{color:'#7d8590',maxTicksLimit:10,font:{family:'IBM Plex Mono',size:10}}, grid:{color:'#21262d'} },
+        y:{ stacked:true, ticks:{color:'#7d8590',font:{family:'IBM Plex Mono',size:10}, callback: v => '$' + v.toFixed(2)}, grid:{color:'#21262d'} }
+      }
+    }
+  });
+
+  // Optimization panel (only relevant June–Sept)
+  const hasSummer = combined.some(d => { const m = parseInt(d.date.slice(5,7)); return m >= 6 && m <= 9; });
+  document.getElementById('hvacOptPanel').style.display = hasSummer ? 'block' : 'none';
+  if (hasSummer) {
+    document.getElementById('hvacOptGrid').innerHTML = [
+      { label:'On-Peak HVAC kWh',     value: totPeakHvac.toFixed(1) + ' kWh' },
+      { label:'On-Peak HVAC Cost',    value: usd(totPeakHvac * PEAK_RATE) },
+      { label:'Savings if shifted',   value: usd(totPeakHvac * (PEAK_RATE - OFF_RATE)) + ' saved' },
+      { label:'Optimal AC window',    value: '7am–1:59pm & 7pm–11pm' },
+    ].map(b => \`<div class="breakdown-row"><span class="name">\${b.label}</span><span class="amt">\${b.value}</span></div>\`).join('');
+  }
+
+  // Day table
+  const thead = \`<thead><tr>
+    <th style="text-align:left">Date</th>
+    <th>GP kWh</th><th>HVAC kWh</th><th>Baseline kWh</th>
+    <th>Cool min</th><th>Heat min</th>
+    <th style="color:var(--on)">OnPk HVAC $</th>
+    <th style="color:var(--off)">OffPk HVAC $</th>
+    <th style="color:var(--sup)">Sup HVAC $</th>
+    <th style="color:var(--total)">HVAC Cost</th>
+  </tr></thead>\`;
+
+  const tbody = combined.map(d => {
+    const pkCost  = (d.peakHvac   * PEAK_RATE).toFixed(2);
+    const offCost = (d.offPeakHvac * OFF_RATE).toFixed(2);
+    const supCost = (d.supHvac    * SUP_RATE).toFixed(2);
+    const tot     = (parseFloat(pkCost) + parseFloat(offCost) + parseFloat(supCost)).toFixed(2);
+    return \`<tr>
+      <td>\${d.date}</td>
+      <td>\${d.kWhTotal.toFixed(2)}</td>
+      <td>\${d.hvacKwh.toFixed(2)}</td>
+      <td>\${d.baseline.toFixed(2)}</td>
+      <td>\${d.coolMin.toFixed(0)}</td>
+      <td>\${d.heatMin.toFixed(0)}</td>
+      <td style="color:var(--on)">\$\${pkCost}</td>
+      <td style="color:var(--off)">\$\${offCost}</td>
+      <td style="color:var(--sup)">\$\${supCost}</td>
+      <td style="color:var(--total);font-weight:600">\$\${tot}</td>
+    </tr>\`;
+  }).join('');
+
+  document.getElementById('hvacTable').innerHTML = thead + '<tbody>' + tbody + '</tbody>';
+
+  // Thermostat specs
+  const specs = (hvacData.thermostats ?? []).map(t =>
+    t.name + ': ' + t.tons + 't · ' + t.seer + ' SEER · compressor ' + t.compKw + ' kW'
+  ).join('   |   ');
+  document.getElementById('hvacSpecs').textContent = specs + '   |   blower 0.65 kW ea (gas system)   |   Note: estimates require calibration against actual bills';
+}
+
+// ── CSV Import UI ────────────────────────────────────────────────────────────
+
+function handleDrop(event) {
+  event.preventDefault();
+  document.getElementById('importDropzone').style.borderColor = 'var(--border)';
+  handleFileSelect(event.dataTransfer.files);
+}
+
+async function handleFileSelect(files) {
+  if (!files || files.length === 0) return;
+
+  const statusEl  = document.getElementById('importStatus');
+  const resultsEl = document.getElementById('importResults');
+  const dropzone  = document.getElementById('importDropzone');
+
+  // Show pending state
+  statusEl.style.display  = 'block';
+  resultsEl.style.display = 'none';
+  statusEl.style.background = 'rgba(88,166,255,.1)';
+  statusEl.style.color      = 'var(--accent)';
+  statusEl.style.border     = '1px solid rgba(88,166,255,.3)';
+  statusEl.textContent = '⏳ Uploading ' + files.length + ' file(s)…';
+  dropzone.style.opacity = '0.5';
+
+  const form = new FormData();
+  for (const f of files) form.append('files', f);
+
+  try {
+    const res  = await fetch('/api/ecobee/import', { method: 'POST', body: form });
+    const data = await res.json();
+    dropzone.style.opacity = '1';
+
+    if (!data.ok) {
+      statusEl.style.background = 'rgba(248,81,73,.1)';
+      statusEl.style.color      = 'var(--on)';
+      statusEl.style.border     = '1px solid rgba(248,81,73,.3)';
+      statusEl.textContent = '✗ ' + data.error;
+      return;
+    }
+
+    // Success
+    statusEl.style.background = 'rgba(63,185,80,.1)';
+    statusEl.style.color      = 'var(--off)';
+    statusEl.style.border     = '1px solid rgba(63,185,80,.3)';
+    statusEl.textContent = '✓ Imported ' + data.imported.length + ' file(s) · ' +
+      data.summary.totalDays + ' total days · ' +
+      data.summary.thermostats.join(', ');
+
+    // Show import details
+    resultsEl.style.display = 'block';
+    resultsEl.innerHTML = data.imported.map(f =>
+      '<div style="font-size:11px;color:var(--muted);font-family:IBM Plex Mono,monospace;padding:4px 0">' +
+      '  ✓ ' + f.filename + ' — ' + f.thermostatName + ' · ' + f.intervals.toLocaleString() + ' intervals' +
+      '</div>'
+    ).join('');
+
+    // Refresh HVAC data in the dashboard.
+    // Re-fetch from /api/ecobee rather than using the import response directly
+    // so the data shape is guaranteed consistent with what renderHvac() expects.
+    hvacData = null;  // clear stale data
+    await loadHvacData();  // re-fetch and re-render
+
+  } catch(e) {
+    dropzone.style.opacity = '1';
+    statusEl.style.background = 'rgba(248,81,73,.1)';
+    statusEl.style.color      = 'var(--on)';
+    statusEl.style.border     = '1px solid rgba(248,81,73,.3)';
+    statusEl.textContent = '✗ Upload failed: ' + e.message;
+  }
 }
 
 // Kick off

@@ -287,12 +287,22 @@ export async function fetchBillingCycles(api, accountNumber, diskCache) {
     console.log('  [billing cycles] Fetching from getMonthlyData()…');
     const monthlyData = await api.getMonthlyData();
 
-    // getMonthlyData returns an array of arrays (one per account)
-    // Each element has { startDate, endDate, kWh, cost }
-    const accountData = monthlyData[0] ?? [];
+    // getMonthlyData returns an array of month objects (one per billing period)
+    // Shape: [{ startDate, endDate, kWh, cost }, ...]
+    // It may also return an array of arrays (one per account) — handle both.
+    let accountData = [];
+    if (Array.isArray(monthlyData)) {
+      if (monthlyData.length > 0 && Array.isArray(monthlyData[0])) {
+        // Array of arrays — take first account
+        accountData = monthlyData[0];
+      } else {
+        // Flat array of month objects
+        accountData = monthlyData;
+      }
+    }
 
     const cycles = accountData
-      .filter(m => m.startDate && m.endDate)
+      .filter(m => m && m.startDate && m.endDate)
       .map(m => ({
         // startDate/endDate are Date objects from the library
         startDate : m.startDate instanceof Date

@@ -4,8 +4,12 @@ node_modules/
 # Environment — contains credentials, never commit
 .env
 
-# Disk cache — contains your personal energy data, never commit
+# Disk caches — contain personal energy data, never commit
 gpower_cache.json
+emporia_cache.json
+
+# Ecobee runtime CSV exports — personal data, not source code
+report-*.csv
 
 # macOS
 .DS_Store
